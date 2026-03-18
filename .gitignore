@@ -1,4 +1,4 @@
 .env
-birthdays.json.json
+birthdays.json
 __pycache__/
 .venv/
