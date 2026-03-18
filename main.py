@@ -3,6 +3,7 @@ import anthropic
 import json
 import os
 import random
+import psycopg2
 from discord.ext import commands, tasks
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
@@ -14,8 +15,8 @@ load_dotenv()
 # ============================================================
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DATABASE_URL = os.getenv("DATABASE_URL")
 BIRTHDAY_CHANNEL_ID = 516095090066980864
-BIRTHDAYS_FILE = "birthdays.json"
 QUOTES_FILE = "quotes.json"
 
 # ============================================================
@@ -60,15 +61,49 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-def load_birthdays():
-    if os.path.exists(BIRTHDAYS_FILE):
-        with open(BIRTHDAYS_FILE, "r") as f:
-            return json.load(f)
-    return {}
+# ============================================================
+# DATABASE
+# ============================================================
+def get_db():
+    return psycopg2.connect(DATABASE_URL)
 
-def save_birthdays(data):
-    with open(BIRTHDAYS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def setup_db():
+    """Creates the birthdays table if it doesn't exist"""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS birthdays (
+            user_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            date TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def save_birthday(user_id, name, date):
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO birthdays (user_id, name, date)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO UPDATE
+        SET name = EXCLUDED.name,
+            date = EXCLUDED.date
+    """, (str(user_id), name, date))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_all_birthdays():
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, name, date FROM birthdays")
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
 def ask_rubee(prompt):
     message = anthropic_client.messages.create(
@@ -84,6 +119,7 @@ def ask_rubee(prompt):
 # ============================================================
 @bot.event
 async def on_ready():
+    setup_db()
     check_birthdays.start()
     post_daily_quote.start()
     print(f"Rubee is alive. Unfortunately.")
@@ -103,31 +139,43 @@ async def on_message(message):
 # ============================================================
 @bot.command()
 async def birthday(ctx, *, date: str):
-    """Set your birthday. Format: !birthday MM/DD"""
+    """Set your own birthday. Format: !birthday MM/DD"""
     try:
         datetime.strptime(date.strip(), "%m/%d")
-        birthdays = load_birthdays()
-        birthdays[str(ctx.author.id)] = {
-            "name": ctx.author.display_name,
-            "date": date.strip()
-        }
-        save_birthdays(birthdays)
+        save_birthday(ctx.author.id, ctx.author.display_name, date.strip())
         response = ask_rubee(f"{ctx.author.display_name} just registered their birthday as {date}. Confirm it's saved with your personality.")
         await ctx.send(response)
     except ValueError:
         await ctx.send("That's not a valid date format. Try MM/DD. Even you can manage that.")
 
 @bot.command()
+async def addbirthday(ctx, member: discord.Member, *, date: str):
+    """Officers only: add a birthday for someone else. Format: !addbirthday @user MM/DD"""
+    officer_role = discord.utils.get(ctx.guild.roles, name="officer")
+    family_role = discord.utils.get(ctx.guild.roles, name="family")
+    allowed_roles = [officer_role, family_role]
+    if not any(role in ctx.author.roles for role in allowed_roles if role):
+        await ctx.send("Nice try. You don't have permission to do that.")
+        return
+    try:
+        datetime.strptime(date.strip(), "%m/%d")
+        save_birthday(member.id, member.display_name, date.strip())
+        response = ask_rubee(f"You just logged {member.display_name}'s birthday as {date} on their behalf. Acknowledge this in character.")
+        await ctx.send(response)
+    except ValueError:
+        await ctx.send("Invalid date format. MM/DD please.")
+
+@bot.command()
 async def birthdays(ctx):
     """List all saved birthdays"""
-    data = load_birthdays()
-    if not data:
+    rows = get_all_birthdays()
+    if not rows:
         await ctx.send("Nobody's registered a birthday yet. Typical.")
         return
     lines = ["**Birthdays in the Familia:**"]
-    sorted_birthdays = sorted(data.values(), key=lambda x: datetime.strptime(x["date"], "%m/%d"))
-    for entry in sorted_birthdays:
-        lines.append(f"• {entry['name']} — {entry['date']}")
+    sorted_rows = sorted(rows, key=lambda x: datetime.strptime(x[2], "%m/%d"))
+    for row in sorted_rows:
+        lines.append(f"• {row[1]} — {row[2]}")
     await ctx.send("\n".join(lines))
 
 # ============================================================
@@ -205,14 +253,15 @@ Stay in character as Rubee — ancient, innocent-faced, deeply unhinged, warm. T
 # ============================================================
 @tasks.loop(hours=24)
 async def check_birthdays():
-    today = datetime.now().strftime("%m/%d")
-    birthdays = load_birthdays()
+    today = datetime.now(timezone.utc) - timedelta(hours=5)
+    today_str = today.strftime("%m/%d")
+    rows = get_all_birthdays()
     channel = bot.get_channel(BIRTHDAY_CHANNEL_ID)
     if not channel:
         return
-    for user_id, data in birthdays.items():
-        if data["date"] == today:
-            prompt = f"Today is {data['name']}'s birthday. Make a birthday announcement for them. You know the familia lore — if this is someone you know personally, roast them with love. If not, still make it a moment."
+    for row in rows:
+        if row[2] == today_str:
+            prompt = f"Today is {row[1]}'s birthday. Make a birthday announcement for them. You know the familia lore — if this is someone you know personally, roast them with love. If not, still make it a moment."
             message = ask_rubee(prompt)
             await channel.send(f"🎂 {message}")
 
